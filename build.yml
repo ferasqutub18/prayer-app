@@ -1,0 +1,270 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+      - name: Accept SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+      - name: Create project
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'EOF0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "prayer"
+          include(":app")
+          EOF0
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'EOF1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF1
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'EOF2'
+          org.gradle.jvmargs=-Xmx2g
+          EOF2
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'EOF3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.feras.prayer"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.feras.prayer"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF3
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <application
+                  android:label="تذكير الصلاة"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+                  android:supportsRtl="true">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".AlarmReceiver" android:exported="false"/>
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF4
+          mkdir -p "$(dirname 'app/src/main/java/com/feras/prayer/Main.kt')"
+          cat > 'app/src/main/java/com/feras/prayer/Main.kt' <<'EOF5'
+          package com.feras.prayer
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlarmManager
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.os.Bundle
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebView
+          import org.json.JSONArray
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  val web = WebView(this)
+                  web.fitsSystemWindows = true
+                  setContentView(web)
+                  web.settings.javaScriptEnabled = true
+                  web.settings.domStorageEnabled = true
+                  web.addJavascriptInterface(Bridge(applicationContext), "Android")
+                  web.loadUrl("file:///android_asset/index.html")
+              }
+          }
+
+          class Bridge(private val ctx: Context) {
+              @JavascriptInterface
+              fun schedule(json: String) {
+                  ctx.getSharedPreferences("p", Context.MODE_PRIVATE).edit().putString("s", json).apply()
+                  Sched.set(ctx)
+              }
+          }
+
+          object Sched {
+              fun set(ctx: Context) {
+                  val json = ctx.getSharedPreferences("p", Context.MODE_PRIVATE).getString("s", "[]") ?: "[]"
+                  val arr = JSONArray(json)
+                  val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val now = System.currentTimeMillis()
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      val t = o.getLong("t")
+                      if (t <= now) continue
+                      val intent = Intent(ctx, AlarmReceiver::class.java).putExtra("n", o.getString("n"))
+                      val pi = PendingIntent.getBroadcast(
+                          ctx, i, intent,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      val exact = Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
+                      if (exact) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pi)
+                      else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pi)
+                  }
+              }
+          }
+
+          class AlarmReceiver : BroadcastReceiver() {
+              override fun onReceive(ctx: Context, intent: Intent) {
+                  val name = intent.getStringExtra("n") ?: return
+                  val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(
+                          NotificationChannel("prayer", "Prayer times", NotificationManager.IMPORTANCE_HIGH)
+                      )
+                  }
+                  val open = PendingIntent.getActivity(
+                      ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(ctx, "prayer") else Notification.Builder(ctx)
+                  b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                      .setContentTitle("🕌 حان موعد صلاة $name")
+                      .setContentText("حيّ على الصلاة")
+                      .setContentIntent(open)
+                      .setAutoCancel(true)
+                  nm.notify(name.hashCode(), b.build())
+              }
+          }
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(ctx: Context, intent: Intent) {
+                  Sched.set(ctx)
+              }
+          }
+          EOF5
+          mkdir -p "$(dirname 'app/src/main/assets/index.html')"
+          cat > 'app/src/main/assets/index.html' <<'EOF6'
+          <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>تذكير الصلاة</title>
+          <style>
+          :root{--bg:#f4f1ea;--cd:#fff;--tx:#1f2a24;--mu:#6b7a70;--ac:#1d7a5a;--a2:#e3f2ec;--bd:#e2ddd0;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+          @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#111a16;--cd:#1a2620;--tx:#e8efe9;--mu:#93a69a;--ac:#4fc79a;--a2:#1f3a2f;--bd:#2a3a32;color-scheme:dark}}
+          :root[data-theme="dark"]{--bg:#111a16;--cd:#1a2620;--tx:#e8efe9;--mu:#93a69a;--ac:#4fc79a;--a2:#1f3a2f;--bd:#2a3a32;color-scheme:dark}
+          html,body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,"Segoe UI",Tahoma,sans-serif}
+          main{max-width:520px;margin:auto;padding:14px}
+          .c{background:var(--cd);border:1px solid var(--bd);border-radius:16px;padding:14px;margin-bottom:12px}
+          h1{font-size:20px;margin:4px 0}.m{color:var(--mu);font-size:13px}
+          select,button{font:inherit;color:var(--tx);background:var(--cd);border:1px solid var(--bd);border-radius:12px;padding:10px;width:100%}
+          button.p{background:var(--ac);color:#fff;border:0}
+          .big{font-size:34px;font-weight:700;color:var(--ac);text-align:center}
+          .r{display:flex;justify-content:space-between;padding:9px 6px;border-bottom:1px solid var(--bd)}.r:last-child{border:0}
+          .r.n{background:var(--a2);border-radius:10px;font-weight:700}
+          .tabs{display:flex;gap:6px;margin-bottom:12px}.tabs button{padding:9px 4px}.tabs .on{background:var(--ac);color:#fff;border:0}
+          .row{display:flex;gap:6px;margin-top:6px}.row button{padding:8px 4px;font-size:13px}
+          .ad{white-space:pre-line;line-height:1.9}
+          </style></head><body><main>
+          <div class="c"><h1>🕌 تذكير الصلاة</h1><div class="m" id="dt"></div><div style="height:8px"></div><select id="city"></select></div>
+          <div class="tabs"><button data-t="a" class="on">اليوم</button><button data-t="b">الأذكار</button><button data-t="c">التقرير</button></div>
+          <section id="a"><div class="c"><div class="m" id="nl"></div><div class="big" id="cd"></div></div><div class="c" id="tm"></div>
+          <button id="nt">🔔 تفعيل التنبيه (والصفحة مفتوحة)</button><p class="m">الحساب بطريقة أم القرى، وقد يختلف دقيقة عن التقويم الرسمي.</p></section>
+          <section id="b" hidden><div class="c"><div class="row"><button data-k="m">🌅 الصباح</button><button data-k="e">🌇 المساء</button><button data-k="s">🤲 بعد الصلاة</button></div></div><div class="c ad" id="ad">اختر نوع الأذكار</div></section>
+          <section id="c" hidden><div class="c ad" id="rp"></div></section>
+          <script>
+          const D2R=Math.PI/180,R2D=180/Math.PI;
+          const sin=x=>Math.sin(x*D2R),cos=x=>Math.cos(x*D2R),tan=x=>Math.tan(x*D2R);
+          const fix=(a,b)=>a-b*Math.floor(a/b);
+          function calcTimes(y,m,d,lat,lng){
+            const jd=Date.UTC(y,m-1,d,12)/864e5+2440587.5, D=jd-2451545;
+            const g=fix(357.529+0.98560028*D,360), q=fix(280.459+0.98564736*D,360);
+            const L=fix(q+1.915*sin(g)+0.02*sin(2*g),360), e=23.439-3.6e-7*D;
+            const ra=fix(Math.atan2(cos(e)*sin(L),cos(L))*R2D/15,24);
+            const eqt=q/15-ra, dec=Math.asin(sin(e)*sin(L))*R2D;
+            const noon=12+3-lng/15-eqt;
+            const T=a=>Math.acos((-sin(a)-sin(dec)*sin(lat))/(cos(dec)*cos(lat)))*R2D/15;
+            const asrA=-Math.atan(1/(1+tan(Math.abs(lat-dec))))*R2D;
+            const maghrib=noon+T(0.833);
+            return {Fajr:noon-T(18.5),Dhuhr:noon,Asr:noon+T(asrA)+0.5/60,Maghrib:maghrib,Isha:maghrib+1.5};
+          }
+          const CITIES={jubail:["الجبيل الصناعية",27.0046,49.6225],makkah:["مكة المكرمة",21.3891,39.8579],jeddah:["جدة",21.5433,39.1728],qunfudhah:["القنفذة",19.1264,41.0789],yanbu:["ينبع",24.0895,38.0618],riyadh:["الرياض",24.7136,46.6753],dammam:["الدمام",26.4207,50.0888],khobar:["الخبر",26.2172,50.1971],hofuf:["الهفوف",25.3647,49.587],madinah:["المدينة المنورة",24.5247,39.5692],taif:["الطائف",21.2703,40.4158],abha:["أبها",18.2164,42.5053],tabuk:["تبوك",28.3838,36.555],buraidah:["بريدة",26.326,43.975],hail:["حائل",27.5114,41.7208],jazan:["جازان",16.8892,42.5611],najran:["نجران",17.4917,44.1322]};
+          const PR={Fajr:"الفجر",Dhuhr:"الظهر",Asr:"العصر",Maghrib:"المغرب",Isha:"العشاء"};
+          const ST={1:"🕌 في المسجد",2:"🏠 في البيت",3:"⚠️ ظرف"};
+          const AD={m:"🌅 أذكار الصباح\n• آية الكرسي\n• الإخلاص والفلق والناس (٣ مرات)\n• أصبحنا وأصبح الملك لله والحمد لله، لا إله إلا الله وحده لا شريك له\n• اللهم بك أصبحنا وبك أمسينا وبك نحيا وبك نموت وإليك النشور\n• بسم الله الذي لا يضر مع اسمه شيء في الأرض ولا في السماء وهو السميع العليم (٣)\n• رضيت بالله رباً وبالإسلام ديناً وبمحمد ﷺ نبياً (٣)\n• سبحان الله وبحمده (١٠٠)",
+          e:"🌇 أذكار المساء\n• آية الكرسي\n• الإخلاص والفلق والناس (٣ مرات)\n• أمسينا وأمسى الملك لله والحمد لله، لا إله إلا الله وحده لا شريك له\n• اللهم بك أمسينا وبك أصبحنا وبك نحيا وبك نموت وإليك المصير\n• أعوذ بكلمات الله التامات من شر ما خلق (٣)\n• بسم الله الذي لا يضر مع اسمه شيء في الأرض ولا في السماء وهو السميع العليم (٣)\n• سبحان الله وبحمده (١٠٠)",
+          s:"🤲 أذكار بعد الصلاة\n• أستغفر الله (٣)\n• اللهم أنت السلام ومنك السلام، تباركت يا ذا الجلال والإكرام\n• سبحان الله (٣٣)، الحمد لله (٣٣)، الله أكبر (٣٣)\n• لا إله إلا الله وحده لا شريك له، له الملك وله الحمد وهو على كل شيء قدير\n• آية الكرسي"};
+          const $=i=>document.getElementById(i),pad=n=>String(n).padStart(2,"0");
+          const fmt=h=>{const m=Math.round(h*60);return pad(Math.floor(m/60)%24)+":"+pad(m%60)};
+          let st={city:"jubail",log:{}};
+          try{Object.assign(st,JSON.parse(localStorage.getItem("pb")||"{}"))}catch(e){}
+          const save=()=>{try{localStorage.setItem("pb",JSON.stringify(st))}catch(e){}};
+          const key=d=>d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());
+          const times=d=>{const c=CITIES[st.city];return calcTimes(d.getFullYear(),d.getMonth()+1,d.getDate(),c[1],c[2])};
+          const at=(d,h)=>{const x=new Date(d);x.setHours(0,0,0,0);return new Date(x.getTime()+Math.round(h*60)*6e4)};
+          $("city").innerHTML=Object.entries(CITIES).map(([k,v])=>`<option value="${k}">📍 ${v[0]}</option>`).join("");
+          $("city").value=st.city;$("city").onchange=e=>{st.city=e.target.value;save();draw();sched()};
+          document.querySelectorAll(".tabs button").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tabs button").forEach(x=>x.classList.toggle("on",x===b));["a","b","c"].forEach(i=>$(i).hidden=i!==b.dataset.t);if(b.dataset.t==="c")report()});
+          document.querySelectorAll("[data-k]").forEach(b=>b.onclick=()=>$("ad").textContent=AD[b.dataset.k]);
+          function nextP(){const now=new Date();for(let i=0;i<2;i++){const d=new Date(now.getTime()+i*864e5),t=times(d);for(const k in PR){const w=at(d,t[k]);if(w>now)return{k,w}}}}
+          function draw(){const now=new Date(),t=times(now),n=nextP();
+          $("dt").textContent=new Intl.DateTimeFormat("ar-SA-u-ca-islamic-umalqura",{weekday:"long",day:"numeric",month:"long",year:"numeric"}).format(now);
+          const lg=st.log[key(now)]||{};
+          $("tm").innerHTML=Object.keys(PR).map(k=>{const past=at(now,t[k])<=now;
+          return `<div class="r ${n.k===k?"n":""}"><span>${n.k===k?"▶️ ":""}${PR[k]}</span><span>${fmt(t[k])}</span></div>`+(past?`<div class="row">${[1,2,3].map(s=>`<button class="${lg[k]===s?"p":""}" onclick="mark('${k}',${s})">${ST[s]}</button>`).join("")}</div>`:"")}).join("")}
+          function mark(k,s){const d=key(new Date());(st.log[d]=st.log[d]||{})[k]=s;save();draw()}
+          function tick(){const n=nextP(),ms=n.w-new Date(),s=Math.floor(ms/1e3);
+          $("nl").textContent="⏳ باقي على "+PR[n.k];$("cd").textContent=pad(Math.floor(s/3600))+":"+pad(Math.floor(s/60)%60)+":"+pad(s%60);
+          if(s===0&&!window.Android){try{if(Notification.permission==="granted")new Notification("🕌 حان موعد صلاة "+PR[n.k])}catch(e){}setTimeout(draw,1500)}}
+          function report(){const p=key(new Date()).slice(0,7),c={1:0,2:0,3:0},m={};let tot=0;
+          for(const d in st.log)if(d.startsWith(p))for(const k in st.log[d]){const s=st.log[d][k];c[s]++;tot++;if(s===1)m[k]=(m[k]||0)+1}
+          $("rp").textContent=tot?`📊 تقرير هذا الشهر\nالمسجّل: ${tot}\n🕌 في المسجد: ${c[1]}\n🏠 في البيت: ${c[2]}\n⚠️ ظرف: ${c[3]}\n✅ صليتها: ${Math.round((c[1]+c[2])*100/tot)}%\n\nالمسجد حسب الفرض:\n`+Object.keys(PR).map(k=>"• "+PR[k]+": "+(m[k]||0)).join("\n"):"ما فيه صلوات مسجّلة لهذا الشهر بعد."}
+          if(window.Android)$("nt").hidden=true;
+          $("nt").onclick=async()=>{try{const r=await Notification.requestPermission();$("nt").textContent=r==="granted"?"✅ التنبيه مفعّل (يعمل والصفحة مفتوحة)":"التنبيه غير مسموح في هذا المتصفح"}catch(e){$("nt").textContent="التنبيه غير مدعوم هنا"}};
+          function sched(){if(!window.Android)return;try{const o=[],now=new Date();for(let i=0;i<7;i++){const d=new Date(now.getTime()+i*864e5),t=times(d);for(const k in PR)o.push({n:PR[k],t:at(d,t[k]).getTime()})}Android.schedule(JSON.stringify(o))}catch(e){}}
+          sched();draw();tick();setInterval(tick,1000);setInterval(draw,6e4);
+          </script></main></body></html>
+          EOF6
+      - name: Build
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prayer-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
